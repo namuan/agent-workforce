@@ -6,8 +6,14 @@ import { type LoadedTeam, loadTeam } from "./team-loader.ts";
 import type { Tool } from "./tools.ts";
 
 const maxToolTurns = 12;
+const maxDebugStringLength = 500;
+const defaultModelTimeoutMs = 120_000;
+const maxModelTimeoutMs = 600_000;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: Debug output must remain single-line text.
+const controlCharacterPattern = /[\x00-\x1F\x7F]/g;
 
 export type DebugLogger = (message: string) => void;
+export type DebugLevel = 0 | 1 | 2;
 
 interface Message {
   readonly content: string | null;
@@ -41,6 +47,7 @@ export interface PendingApproval {
 
 export interface Session {
   readonly debug?: DebugLogger;
+  readonly debugLevel: DebugLevel;
   readonly history: Message[];
   readonly id: string;
   readonly pendingApprovals: Map<string, PendingApproval>;
@@ -53,15 +60,26 @@ export interface ChatResult {
   readonly text: string;
 }
 
-export const debugEnabled = (): boolean =>
-  ["1", "true"].includes(process.env.DEBUG?.toLowerCase() ?? "");
+export const debugLevel = (): DebugLevel => {
+  const value = process.env.DEBUG?.toLowerCase();
+  if (value === "2") {
+    return 2;
+  }
+  return ["1", "true"].includes(value ?? "") ? 1 : 0;
+};
+
+export const debugEnabled = (): boolean => debugLevel() > 0;
 
 export const createSession = (
   principalId: string,
   team: string,
-  debug?: DebugLogger
+  debug?: DebugLogger,
+  sessionDebugLevel: DebugLevel = debug
+    ? (Math.max(debugLevel(), 1) as DebugLevel)
+    : 0
 ): Session => ({
   debug,
+  debugLevel: sessionDebugLevel,
   history: [],
   id: randomUUID(),
   pendingApprovals: new Map(),
@@ -69,8 +87,135 @@ export const createSession = (
   team,
 });
 
-const logDebug = (session: Session, message: string): void => {
-  session.debug?.(message);
+const logDebug = (
+  session: Session,
+  message: string,
+  minimumLevel: DebugLevel = 1
+): void => {
+  if (session.debugLevel >= minimumLevel) {
+    session.debug?.(message);
+  }
+};
+
+const normalizeDebugText = (value: string): string =>
+  value.replace(controlCharacterPattern, " ");
+
+const redactDebugText = (value: string): string =>
+  normalizeDebugText(value)
+    .replace(/(https?:\/\/)[^/@\s]+@/gi, "$1[redacted]@")
+    .replace(
+      /(authorization\s*:\s*)(?:basic|bearer)\s+[^\s,]+/gi,
+      "$1[redacted]"
+    )
+    .replace(/(bearer\s+)[^\s,]+/gi, "$1[redacted]")
+    .replace(
+      /((?:(?:access|api|private|shared|signing|ssh)[-_]?key|\bkey\b|auth|jwt|sig|signature|token|secret|password|credential|passphrase)["']?\s*[:=]\s*["']?)[^\s,}"']+/gi,
+      "$1[redacted]"
+    )
+    .slice(0, maxDebugStringLength);
+
+const isSensitiveDebugField = (field: string): boolean =>
+  /authorization|(?:access|api|private|shared|signing|ssh)[-_]?key|^key$|auth|jwt|sig|signature|token|secret|password|cookie|credential|passphrase/i.test(
+    field
+  );
+
+const isLargeDebugField = (field: string): boolean =>
+  /brief|content|html|message|prompt|text/i.test(field);
+
+const sanitizeDebugValue = (value: unknown, field = "", depth = 0): unknown => {
+  if (isSensitiveDebugField(field)) {
+    return "[redacted]";
+  }
+  if (depth > 4) {
+    return "[truncated]";
+  }
+  if (typeof value === "string") {
+    if (isLargeDebugField(field) || value.length > maxDebugStringLength) {
+      return `[${value.length} characters]`;
+    }
+    return redactDebugText(value);
+  }
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, 20)
+      .map((item) => sanitizeDebugValue(item, "", depth + 1));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .slice(0, 20)
+        .map(([key, item]) => [key, sanitizeDebugValue(item, key, depth + 1)])
+    );
+  }
+  return value;
+};
+
+export const formatDebugToolArguments = (
+  input: unknown,
+  tool: Tool
+): string => {
+  const properties = tool.parameters.properties;
+  if (
+    !input ||
+    typeof input !== "object" ||
+    Array.isArray(input) ||
+    !properties ||
+    typeof properties !== "object" ||
+    Array.isArray(properties)
+  ) {
+    return "[input omitted]";
+  }
+  const suppliedInput = input as Record<string, unknown>;
+  const schemaProperties = properties as Record<string, unknown>;
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.entries(suppliedInput)
+        .filter(
+          ([key]) =>
+            Object.hasOwn(schemaProperties, key) &&
+            isScalarDebugSchema(schemaProperties[key]) &&
+            isScalarDebugValue(suppliedInput[key])
+        )
+        .map(([key, value]) => [key, sanitizeDebugValue(value, key)])
+    )
+  );
+};
+
+const isScalarDebugSchema = (value: unknown): boolean => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const type = (value as { readonly type?: unknown }).type;
+  return ["boolean", "integer", "null", "number", "string"].includes(
+    type as string
+  );
+};
+
+const isScalarDebugValue = (value: unknown): boolean =>
+  typeof value === "boolean" ||
+  typeof value === "number" ||
+  typeof value === "string";
+
+export const sanitizeDebugError = (value: unknown): string => {
+  const message = normalizeDebugText(String(value));
+  const requestFailure = message.match(/^(.+request failed \(\d+\)):/i);
+  if (requestFailure) {
+    return "Remote request failed.";
+  }
+  const trimmed = message.trimStart();
+  if (
+    trimmed.startsWith("[") ||
+    trimmed.startsWith("{") ||
+    trimmed.startsWith('"')
+  ) {
+    return "[structured detail omitted]";
+  }
+  const jsonStart = message.search(/[[{]/);
+  if (jsonStart > 0) {
+    const prefix = redactDebugText(message.slice(0, jsonStart));
+    return `${prefix}[structured detail omitted]`;
+  }
+  return redactDebugText(message);
 };
 
 const readText = async (path: string): Promise<string> =>
@@ -142,39 +287,98 @@ const modelRequest = async (
   messages: readonly Message[],
   tools: readonly Tool[]
 ): Promise<ChatResponse> => {
+  const configuredTimeout = Number(process.env.MODEL_TIMEOUT_MS);
+  const timeoutMs =
+    Number.isInteger(configuredTimeout) &&
+    configuredTimeout > 0 &&
+    configuredTimeout <= maxModelTimeoutMs
+      ? configuredTimeout
+      : defaultModelTimeoutMs;
   const baseUrl = (process.env.MODEL_URL ?? "http://localhost:9090/v1").replace(
     /\/$/,
     ""
   );
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    body: JSON.stringify({
-      messages,
-      model: process.env.MODEL_NAME ?? "qwen3-8b",
-      temperature: 0.3,
-      tools: tools.map((tool) => ({
-        function: {
-          description: tool.description,
-          name: tool.name,
-          parameters: tool.parameters,
-        },
-        type: "function",
-      })),
-    }),
-    headers: {
-      "content-type": "application/json",
-      ...(process.env.MODEL_API_KEY
-        ? { authorization: `Bearer ${process.env.MODEL_API_KEY}` }
-        : {}),
-    },
-    method: "POST",
-  });
-  const result = (await response.json()) as ChatResponse;
-  if (!response.ok || result.error) {
-    throw new Error(
-      result.error?.message ?? `Model request failed (${response.status}).`
-    );
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/chat/completions`, {
+      body: JSON.stringify({
+        messages,
+        model: process.env.MODEL_NAME ?? "qwen3-8b",
+        temperature: 0.3,
+        tools: tools.map((tool) => ({
+          function: {
+            description: tool.description,
+            name: tool.name,
+            parameters: tool.parameters,
+          },
+          type: "function",
+        })),
+      }),
+      headers: {
+        "content-type": "application/json",
+        ...(process.env.MODEL_API_KEY
+          ? { authorization: `Bearer ${process.env.MODEL_API_KEY}` }
+          : {}),
+      },
+      method: "POST",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      ["AbortError", "TimeoutError"].includes(error.name)
+    ) {
+      throw new Error(`Model request timed out after ${timeoutMs}ms.`, {
+        cause: error,
+      });
+    }
+    throw error;
+  }
+  let result: ChatResponse;
+  try {
+    result = (await response.json()) as ChatResponse;
+  } catch (error) {
+    throw new Error(`Model response was not valid JSON (${response.status}).`, {
+      cause: error,
+    });
+  }
+  if (!response.ok) {
+    throw new Error(`Model request failed (${response.status}).`);
+  }
+  if (result.error) {
+    throw new Error(`Model returned an error response (${response.status}).`);
   }
   return result;
+};
+
+const modelFailureDetail = (error: unknown): string => {
+  if (!(error instanceof Error)) {
+    return "Model request failed.";
+  }
+  if (
+    /^(Model request failed|Model request timed out|Model response was not valid JSON|Model returned an error response)/.test(
+      error.message
+    )
+  ) {
+    return error.message;
+  }
+  return "Model request failed.";
+};
+
+const delegatedFailureDetail = (error: unknown): string => {
+  const detail = modelFailureDetail(error);
+  if (detail !== "Model request failed.") {
+    return `delegated agent ${detail[0]?.toLowerCase()}${detail.slice(1)}`;
+  }
+  if (error instanceof Error) {
+    if (error.message === "The agent exceeded its tool-call limit.") {
+      return "delegated agent exceeded its tool-call limit.";
+    }
+    if (error.message === "The model returned no message.") {
+      return "delegated agent received an invalid model response.";
+    }
+  }
+  return "delegated agent failed.";
 };
 
 const systemPrompt = async (
@@ -246,8 +450,17 @@ const runAgent = async (
   logDebug(session, `${agent}: started`);
   const tools = team.definition.createTools({
     agent,
-    delegate: async (specialist, brief) =>
-      delegate(team, specialist, brief, session),
+    delegate: async (specialist, brief) => {
+      try {
+        return await delegate(team, specialist, brief, session);
+      } catch (error) {
+        const detail = delegatedFailureDetail(error);
+        logDebug(session, `lead: ${detail}`);
+        throw new Error(`${detail[0]?.toUpperCase()}${detail.slice(1)}`, {
+          cause: error,
+        });
+      }
+    },
     loadSkill: (name, reference) => loadSkill(team, agent, name, reference),
     principalId: session.principalId,
     requestApproval: (description, action) =>
@@ -268,7 +481,23 @@ const runAgent = async (
   }
   for (let turn = 0; turn < maxToolTurns; turn += 1) {
     logDebug(session, `${agent}: model turn ${turn + 1}`);
-    const response = await modelRequest(messages, tools);
+    let response: ChatResponse;
+    try {
+      response = await modelRequest(messages, tools);
+    } catch (error) {
+      const detail = modelFailureDetail(error);
+      const timedOut = detail.startsWith("Model request timed out");
+      logDebug(
+        session,
+        timedOut
+          ? `${agent}: model request timed out`
+          : `${agent}: model request failed`
+      );
+      if (!timedOut) {
+        logDebug(session, `${agent}: model error ${detail}`, 2);
+      }
+      throw error;
+    }
     const choice = response.choices?.[0]?.message;
     if (!choice) {
       throw new Error("The model returned no message.");
@@ -294,15 +523,33 @@ const runAgent = async (
       const toolName = tool?.name ?? "unknown tool";
       logDebug(session, `${agent}: running tool ${toolName}`);
       let value: unknown;
-      try {
-        value = tool
-          ? await tool.run(JSON.parse(call.function.arguments) as unknown)
-          : { error: `Unknown tool: ${call.function.name}` };
-      } catch (error) {
-        value = {
-          error:
-            error instanceof Error ? error.message : "Tool execution failed.",
-        };
+      if (tool) {
+        let input: unknown;
+        try {
+          input = JSON.parse(call.function.arguments) as unknown;
+        } catch {
+          value = { error: "Invalid tool input." };
+        }
+        if (value === undefined) {
+          logDebug(
+            session,
+            `${agent}: tool ${toolName} input ${formatDebugToolArguments(input, tool)}`,
+            2
+          );
+          try {
+            value = await tool.run(input);
+          } catch (error) {
+            value = {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Tool execution failed.",
+            };
+          }
+        }
+      } else {
+        logDebug(session, `${agent}: model requested an unavailable tool`);
+        value = { error: "Model requested an unavailable tool." };
       }
       if (typeof value === "object" && value && "approvalId" in value) {
         const approvalId = String(value.approvalId);
@@ -317,7 +564,9 @@ const runAgent = async (
         return {
           approvalId,
           text: String(
-            (value as { message?: string }).message ?? "Approval required."
+            (value as { message?: string; text?: string }).message ??
+              (value as { text?: string }).text ??
+              "Approval required."
           ),
         };
       }
@@ -327,6 +576,15 @@ const runAgent = async (
           ? `${agent}: tool ${toolName} failed`
           : `${agent}: tool ${toolName} completed`
       );
+      if (typeof value === "object" && value && "error" in value) {
+        logDebug(
+          session,
+          `${agent}: tool ${toolName} error ${sanitizeDebugError(
+            (value as { error?: unknown }).error
+          )}`,
+          2
+        );
+      }
       const toolMessage = asToolMessage(call.id, value);
       messages.push(toolMessage);
       if (agent === "lead") {
@@ -348,7 +606,12 @@ const delegate = async (
   }
   logDebug(parent, "lead: delegating");
   const child: Session = {
-    ...createSession(parent.principalId, parent.team, parent.debug),
+    ...createSession(
+      parent.principalId,
+      parent.team,
+      parent.debug,
+      parent.debugLevel
+    ),
     pendingApprovals: parent.pendingApprovals,
   };
   return runAgent(team, specialist, child, brief);
@@ -386,7 +649,14 @@ export const approve = async (
     };
   }
   logDebug(session, "approval: executing saved action");
-  const result = await pending.action();
+  let result: unknown;
+  try {
+    result = await pending.action();
+  } catch (error) {
+    logDebug(session, "approval: action failed");
+    logDebug(session, `approval: action error ${sanitizeDebugError(error)}`, 2);
+    throw error;
+  }
   logDebug(session, "approval: action completed");
   if (!pending.toolCallId) {
     return {

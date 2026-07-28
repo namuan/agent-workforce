@@ -292,6 +292,7 @@ export const createSoftwareDevelopmentTools = (
         const value = object(input);
         const path = text(value, "path", 500);
         const content = text(value, "content", maxFileLength);
+        await workspacePath(path);
         return approval(
           context,
           `Replace workspace file ${path}.`,

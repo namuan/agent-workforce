@@ -66,7 +66,10 @@ The default model endpoint matches the prior local setup:
 MODEL_URL=http://localhost:9090/v1
 MODEL_NAME=qwen3-8b
 MODEL_API_KEY=optional-token
+MODEL_TIMEOUT_MS=120000
 ```
+
+Model requests time out after 120 seconds by default. Set `MODEL_TIMEOUT_MS` to an integer from 1 to 600000 when your model needs a different limit.
 
 The CLI accepts `/exit`. When an action needs consent, it returns a token; run `/approve <token>` to perform that exact pending action. Tokens expire after 10 minutes.
 
@@ -78,7 +81,11 @@ Set `DEBUG=1` to print a live trace while the runtime handles each request:
 DEBUG=1 TEAM=software-development DEV_WORKSPACE_DIR=/absolute/path/to/worktree pnpm dev
 ```
 
-The trace reports agent starts, model turns, tool names, delegation, approval pauses, and completion. It does not print prompts, user messages, tool arguments, tool output, or credentials. The HTTP server writes the same trace to standard error when started with `DEBUG=1`.
+`DEBUG=1` reports agent starts, model turns, tool names, delegation, approval pauses, and completion. It does not print prompts, user messages, tool arguments, tool output, or credentials.
+
+Set `DEBUG=2` when you need to diagnose a tool failure. It includes sanitized declared scalar tool arguments, safe model and delegated-agent failure categories, and a failure detail. Credential-like fields are redacted, undeclared and nested arguments are omitted, and remote response bodies or structured error payloads are omitted. Do not use it where the remaining file paths or scalar arguments would be sensitive.
+
+The HTTP server writes the same trace to standard error when started with either debug level.
 
 ## HTTP API
 
