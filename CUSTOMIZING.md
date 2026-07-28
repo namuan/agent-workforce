@@ -20,7 +20,7 @@ Add a `Tool` object in the team's tool factory. Give it a narrow JSON Schema, va
 
 Set `DATA_DIR` to move marketing state. To use a database or object store, update the owning team's storage helpers while preserving namespace and identifier checks.
 
-For software-development work, set `DEV_WORKSPACE_DIR` to an approved worktree. The native tools read and replace existing files only within that directory, reject traversal and symlink escapes, and only run allowlisted `pnpm` checks.
+For software-development work, set `DEV_WORKSPACE_DIR` to an approved workspace. It does not need to be a Git repository. The native tools read and replace existing files only within that directory, create new files only in its root, reject traversal and symlink escapes, and only run allowlisted `pnpm` checks.
 
 ## Change the model provider
 

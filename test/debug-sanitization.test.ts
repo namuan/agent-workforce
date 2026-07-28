@@ -44,7 +44,8 @@ test("DEBUG=2 sanitizes failed approved actions", async () => {
     "debug-user",
     "marketing",
     (message) => events.push(message),
-    2
+    2,
+    ""
   );
   session.pendingApprovals.set("approval-id", {
     action: async () => {

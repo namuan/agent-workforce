@@ -1,7 +1,15 @@
-import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { readdir, readFile } from "node:fs/promises";
-import { resolve, sep } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { constants, existsSync } from "node:fs";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  realpath,
+} from "node:fs/promises";
+import { dirname, join, parse, resolve, sep } from "node:path";
 import { type LoadedTeam, loadTeam } from "./team-loader.ts";
 import type { Tool } from "./tools.ts";
 
@@ -11,9 +19,12 @@ const defaultModelTimeoutMs = 120_000;
 const maxModelTimeoutMs = 600_000;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: Debug output must remain single-line text.
 const controlCharacterPattern = /[\x00-\x1F\x7F]/g;
+const logWriteQueues = new Map<string, Promise<void>>();
 
 export type DebugLogger = (message: string) => void;
 export type DebugLevel = 0 | 1 | 2;
+
+class DelegatedAgentFailure extends Error {}
 
 interface Message {
   readonly content: string | null;
@@ -50,6 +61,8 @@ export interface Session {
   readonly debugLevel: DebugLevel;
   readonly history: Message[];
   readonly id: string;
+  readonly logPath?: string;
+  readonly logSessionId?: string;
   readonly pendingApprovals: Map<string, PendingApproval>;
   readonly principalId: string;
   readonly team: string;
@@ -70,18 +83,145 @@ export const debugLevel = (): DebugLevel => {
 
 export const debugEnabled = (): boolean => debugLevel() > 0;
 
+const sessionLogPath = (id: string): string => {
+  const dataDirectory = process.env.DATA_DIR ?? ".data";
+  const directory = resolve(
+    process.env.SESSION_LOG_DIR ?? join(dataDirectory, "session-logs")
+  );
+  const fileId =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+      ? id
+      : createHash("sha256").update(id).digest("hex");
+  return join(directory, `${fileId}.jsonl`);
+};
+
+const secureLogDirectory = async (directory: string): Promise<void> => {
+  const root = parse(directory).root;
+  let current = root;
+  for (const component of directory
+    .slice(root.length)
+    .split(sep)
+    .filter(Boolean)) {
+    current = join(current, component);
+    try {
+      const metadata = await lstat(current);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+        if (current === join(root, "tmp") && metadata.isSymbolicLink()) {
+          current = await realpath(current);
+          continue;
+        }
+        throw new Error("Session log directory must be a real directory.");
+      }
+    } catch (error) {
+      if ((error as { code?: string }).code !== "ENOENT") {
+        throw error;
+      }
+      await mkdir(current, { mode: 0o700 });
+    }
+  }
+  const metadata = await lstat(directory);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error("Session log directory must be a real directory.");
+  }
+  await chmod(directory, 0o700);
+};
+
+const appendSessionLog = async (
+  path: string,
+  record: string
+): Promise<void> => {
+  await secureLogDirectory(dirname(path));
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error("Session log file must be a regular file.");
+    }
+    await chmod(path, 0o600);
+  } catch (error) {
+    if ((error as { code?: string }).code !== "ENOENT") {
+      throw error;
+    }
+  }
+  const flags =
+    // biome-ignore lint/suspicious/noBitwiseOperators: POSIX open flags must be combined bitwise.
+    constants.O_APPEND |
+    constants.O_CREAT |
+    constants.O_WRONLY |
+    constants.O_NOFOLLOW;
+  const handle = await open(path, flags, 0o600);
+  try {
+    await handle.writeFile(`${record}\n`, "utf8");
+  } finally {
+    await handle.close();
+  }
+};
+
+const queueSessionLog = (path: string, record: string): Promise<void> => {
+  const previous = logWriteQueues.get(path) ?? Promise.resolve();
+  const next = previous
+    .catch(() => undefined)
+    .then(() => appendSessionLog(path, record));
+  const queued = next.finally(() => {
+    if (logWriteQueues.get(path) === queued) {
+      logWriteQueues.delete(path);
+    }
+  });
+  logWriteQueues.set(path, queued);
+  return queued;
+};
+
+const logSessionEvent = async (
+  session: Session,
+  event: string,
+  details?: unknown
+): Promise<void> => {
+  if (!session.logPath) {
+    return;
+  }
+  try {
+    const record = JSON.stringify(
+      {
+        at: new Date().toISOString(),
+        details,
+        event,
+        principalId: session.principalId,
+        sessionId: session.logSessionId ?? session.id,
+        team: session.team,
+      },
+      (_key, value) =>
+        typeof value === "bigint"
+          ? value.toString()
+          : value instanceof Error
+            ? { message: value.message, name: value.name }
+            : value
+    );
+    await queueSessionLog(session.logPath, record);
+  } catch (error) {
+    session.debug?.(
+      `[log] failed to write session event: ${
+        error instanceof Error ? error.message : "Unknown error."
+      }`
+    );
+  }
+};
+
 export const createSession = (
   principalId: string,
   team: string,
   debug?: DebugLogger,
   sessionDebugLevel: DebugLevel = debug
     ? (Math.max(debugLevel(), 1) as DebugLevel)
-    : 0
+    : 0,
+  logPath?: string,
+  logSessionId?: string,
+  id: string = randomUUID()
 ): Session => ({
   debug,
   debugLevel: sessionDebugLevel,
   history: [],
-  id: randomUUID(),
+  id,
+  logPath: logPath ?? sessionLogPath(id),
+  logSessionId: logSessionId ?? id,
   pendingApprovals: new Map(),
   principalId,
   team,
@@ -94,6 +234,19 @@ const logDebug = (
 ): void => {
   if (session.debugLevel >= minimumLevel) {
     session.debug?.(message);
+  }
+};
+
+const logModelEndpoint = (value: string): string => {
+  try {
+    const endpoint = new URL(value);
+    endpoint.password = "";
+    endpoint.hash = "";
+    endpoint.search = "";
+    endpoint.username = "";
+    return endpoint.toString();
+  } catch {
+    return "[invalid model endpoint]";
   }
 };
 
@@ -284,6 +437,7 @@ const loadSkill = async (
 };
 
 const modelRequest = async (
+  session: Session,
   messages: readonly Message[],
   tools: readonly Tool[]
 ): Promise<ChatResponse> => {
@@ -298,22 +452,28 @@ const modelRequest = async (
     /\/$/,
     ""
   );
+  const requestBody = {
+    messages,
+    model: process.env.MODEL_NAME ?? "qwen3-8b",
+    temperature: 0.3,
+    tools: tools.map((tool) => ({
+      function: {
+        description: tool.description,
+        name: tool.name,
+        parameters: tool.parameters,
+      },
+      type: "function",
+    })),
+  };
+  await logSessionEvent(session, "model_request", {
+    body: requestBody,
+    endpoint: logModelEndpoint(`${baseUrl}/chat/completions`),
+    timeoutMs,
+  });
   let response: Response;
   try {
     response = await fetch(`${baseUrl}/chat/completions`, {
-      body: JSON.stringify({
-        messages,
-        model: process.env.MODEL_NAME ?? "qwen3-8b",
-        temperature: 0.3,
-        tools: tools.map((tool) => ({
-          function: {
-            description: tool.description,
-            name: tool.name,
-            parameters: tool.parameters,
-          },
-          type: "function",
-        })),
-      }),
+      body: JSON.stringify(requestBody),
       headers: {
         "content-type": "application/json",
         ...(process.env.MODEL_API_KEY
@@ -324,6 +484,9 @@ const modelRequest = async (
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
+    await logSessionEvent(session, "model_request_error", {
+      message: error instanceof Error ? error.message : "Model request failed.",
+    });
     if (
       error instanceof Error &&
       ["AbortError", "TimeoutError"].includes(error.name)
@@ -334,20 +497,53 @@ const modelRequest = async (
     }
     throw error;
   }
+  let responseText: string;
+  try {
+    responseText = await response.text();
+  } catch (error) {
+    await logSessionEvent(session, "model_response_error", {
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not read model response.",
+      status: response.status,
+    });
+    throw new Error("Could not read model response.", { cause: error });
+  }
   let result: ChatResponse;
   try {
-    result = (await response.json()) as ChatResponse;
+    result = JSON.parse(responseText) as ChatResponse;
   } catch (error) {
+    await logSessionEvent(session, "model_response", {
+      error: "Response was not valid JSON.",
+      raw: responseText,
+      status: response.status,
+    });
     throw new Error(`Model response was not valid JSON (${response.status}).`, {
       cause: error,
     });
   }
   if (!response.ok) {
+    await logSessionEvent(session, "model_response", {
+      body: result,
+      raw: responseText,
+      status: response.status,
+    });
     throw new Error(`Model request failed (${response.status}).`);
   }
   if (result.error) {
+    await logSessionEvent(session, "model_response", {
+      body: result,
+      raw: responseText,
+      status: response.status,
+    });
     throw new Error(`Model returned an error response (${response.status}).`);
   }
+  await logSessionEvent(session, "model_response", {
+    body: result,
+    raw: responseText,
+    status: response.status,
+  });
   return result;
 };
 
@@ -447,7 +643,9 @@ const runAgent = async (
   session: Session,
   message: string
 ): Promise<ChatResult> => {
+  const historyStart = session.history.length;
   logDebug(session, `${agent}: started`);
+  await logSessionEvent(session, "agent_started", { agent, message });
   const tools = team.definition.createTools({
     agent,
     delegate: async (specialist, brief) => {
@@ -456,9 +654,12 @@ const runAgent = async (
       } catch (error) {
         const detail = delegatedFailureDetail(error);
         logDebug(session, `lead: ${detail}`);
-        throw new Error(`${detail[0]?.toUpperCase()}${detail.slice(1)}`, {
-          cause: error,
-        });
+        throw new DelegatedAgentFailure(
+          `${detail[0]?.toUpperCase()}${detail.slice(1)}`,
+          {
+            cause: error,
+          }
+        );
       }
     },
     loadSkill: (name, reference) => loadSkill(team, agent, name, reference),
@@ -483,7 +684,7 @@ const runAgent = async (
     logDebug(session, `${agent}: model turn ${turn + 1}`);
     let response: ChatResponse;
     try {
-      response = await modelRequest(messages, tools);
+      response = await modelRequest(session, messages, tools);
     } catch (error) {
       const detail = modelFailureDetail(error);
       const timedOut = detail.startsWith("Model request timed out");
@@ -514,7 +715,9 @@ const runAgent = async (
     }
     if (calls.length === 0) {
       logDebug(session, `${agent}: completed`);
-      return { text: choice.content?.trim() || "Done." };
+      const result = { text: choice.content?.trim() || "Done." };
+      await logSessionEvent(session, "agent_completed", { agent, result });
+      return result;
     }
     for (const call of calls) {
       const tool = tools.find(
@@ -522,6 +725,12 @@ const runAgent = async (
       );
       const toolName = tool?.name ?? "unknown tool";
       logDebug(session, `${agent}: running tool ${toolName}`);
+      await logSessionEvent(session, "tool_call", {
+        agent,
+        arguments: call.function.arguments,
+        name: call.function.name,
+        toolCallId: call.id,
+      });
       let value: unknown;
       if (tool) {
         let input: unknown;
@@ -539,6 +748,12 @@ const runAgent = async (
           try {
             value = await tool.run(input);
           } catch (error) {
+            if (error instanceof DelegatedAgentFailure) {
+              if (agent === "lead") {
+                session.history.splice(historyStart);
+              }
+              throw error;
+            }
             value = {
               error:
                 error instanceof Error
@@ -551,6 +766,12 @@ const runAgent = async (
         logDebug(session, `${agent}: model requested an unavailable tool`);
         value = { error: "Model requested an unavailable tool." };
       }
+      await logSessionEvent(session, "tool_result", {
+        agent,
+        name: toolName,
+        toolCallId: call.id,
+        value,
+      });
       if (typeof value === "object" && value && "approvalId" in value) {
         const approvalId = String(value.approvalId);
         const pending = session.pendingApprovals.get(approvalId);
@@ -605,12 +826,15 @@ const delegate = async (
     throw new Error("Unknown specialist.");
   }
   logDebug(parent, "lead: delegating");
+  await logSessionEvent(parent, "delegation_started", { specialist });
   const child: Session = {
     ...createSession(
       parent.principalId,
       parent.team,
       parent.debug,
-      parent.debugLevel
+      parent.debugLevel,
+      parent.logPath,
+      parent.logSessionId
     ),
     pendingApprovals: parent.pendingApprovals,
   };
@@ -621,19 +845,34 @@ export const chat = async (
   session: Session,
   message: string
 ): Promise<ChatResult> => {
-  const pending = pendingApprovalResult(session);
-  if (pending) {
-    logDebug(session, "lead: chat blocked by pending approval");
-    return pending;
+  await logSessionEvent(session, "user_message", { message });
+  try {
+    const pending = pendingApprovalResult(session);
+    if (pending) {
+      logDebug(session, "lead: chat blocked by pending approval");
+      return pending;
+    }
+    logDebug(session, "lead: loading team");
+    return await runAgent(
+      await loadTeam(session.team),
+      "lead",
+      session,
+      message
+    );
+  } catch (error) {
+    await logSessionEvent(session, "terminal_error", {
+      agent: "lead",
+      error: error instanceof Error ? error.message : "Request failed.",
+    });
+    throw error;
   }
-  logDebug(session, "lead: loading team");
-  return runAgent(await loadTeam(session.team), "lead", session, message);
 };
 
 export const approve = async (
   session: Session,
   approvalId: string
 ): Promise<ChatResult> => {
+  await logSessionEvent(session, "approval_requested", { approvalId });
   const pending = session.pendingApprovals.get(approvalId);
   if (!pending) {
     logDebug(session, "approval: missing or already used");
@@ -649,15 +888,24 @@ export const approve = async (
     };
   }
   logDebug(session, "approval: executing saved action");
+  await logSessionEvent(session, "approval_executing", {
+    approvalId,
+    description: pending.description,
+  });
   let result: unknown;
   try {
     result = await pending.action();
   } catch (error) {
     logDebug(session, "approval: action failed");
     logDebug(session, `approval: action error ${sanitizeDebugError(error)}`, 2);
+    await logSessionEvent(session, "approval_failed", {
+      approvalId,
+      error: error instanceof Error ? error.message : "Approval action failed.",
+    });
     throw error;
   }
   logDebug(session, "approval: action completed");
+  await logSessionEvent(session, "approval_completed", { approvalId, result });
   if (!pending.toolCallId) {
     return {
       text: `${pending.description}\n\n${JSON.stringify(result, null, 2)}`,

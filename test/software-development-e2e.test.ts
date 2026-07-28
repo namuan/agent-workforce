@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert/strict";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { createSoftwareDevelopmentTools } from "../teams/software-development/tools.ts";
@@ -20,9 +20,31 @@ const modelResponse = (messages: ModelMessage[]): unknown => {
   const hasDelegated = messages.some((message) =>
     message.tool_calls?.some((call) => call.function.name === "delegate")
   );
+  const hasDelegateTimeout = messages.some(
+    (message) =>
+      message.role === "user" &&
+      message.content?.includes("DEBUG_DELEGATE_TIMEOUT")
+  );
   const request = originalUserMessage(messages);
 
   if (system.includes("You lead a software-development team.")) {
+    if (hasDelegateTimeout) {
+      return {
+        choices: [
+          {
+            message: {
+              content: null,
+              tool_calls: [
+                toolCall("delegate", {
+                  brief: "DEBUG_DELEGATE_TIMEOUT",
+                  specialist: "backend-engineer",
+                }),
+              ],
+            },
+          },
+        ],
+      };
+    }
     if (request.includes("DEBUG_DIRECT_MODEL_FAILURE")) {
       return { error: { message: "direct-model-sentinel" } };
     }
@@ -246,7 +268,17 @@ test("software-development team runs against a safe workspace and mocked GitHub"
   const model = createModelMock<{ messages: ModelMessage[] }>(
     async ({ messages }) => {
       modelRequestCount += 1;
-      if (originalUserMessage(messages).includes("DEBUG_MODEL_TIMEOUT")) {
+      const request = originalUserMessage(messages);
+      const system = messages[0]?.content ?? "";
+      if (
+        request.includes("DEBUG_MODEL_TIMEOUT") ||
+        (messages.some(
+          (message) =>
+            message.role === "user" &&
+            message.content?.includes("DEBUG_DELEGATE_TIMEOUT")
+        ) &&
+          system.includes("You are the backend engineer."))
+      ) {
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
       return modelResponse(messages);
@@ -309,6 +341,63 @@ test("software-development team runs against a safe workspace and mocked GitHub"
       );
     }
   );
+
+  await t.test("each session writes a central model and tool log", async () => {
+    const logDirectory = await scope.temporaryDirectory("session-logs-");
+    scope.setEnvironment({ SESSION_LOG_DIR: logDirectory });
+    const debugEventsBefore = debugEvents.length;
+    const result = await debugChat.start({
+      message: "REVIEW SESSION LOG",
+      principalId: "log-user",
+    });
+    assert.equal(result.text, "Development-team handoff complete.");
+    assert.deepEqual(
+      debugEvents
+        .slice(debugEventsBefore)
+        .filter((event) => event.startsWith("[log]")),
+      []
+    );
+
+    const records = (
+      await readFile(join(logDirectory, `${result.sessionId}.jsonl`), "utf8")
+    )
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            details?: { body?: { messages?: unknown[] } };
+            event: string;
+            sessionId: string;
+          }
+      );
+    assert.ok(records.every((record) => record.sessionId === result.sessionId));
+    for (const event of [
+      "user_message",
+      "agent_started",
+      "model_request",
+      "model_response",
+      "tool_call",
+      "tool_result",
+      "agent_completed",
+    ]) {
+      assert.ok(records.some((record) => record.event === event));
+    }
+    assert.ok(
+      records.some(
+        (record) =>
+          record.event === "model_request" &&
+          Array.isArray(record.details?.body?.messages)
+      )
+    );
+    assert.equal((await stat(logDirectory)).mode % 0o1000, 0o700);
+    assert.equal(
+      (await stat(join(logDirectory, `${result.sessionId}.jsonl`))).mode %
+        0o1000,
+      0o600
+    );
+    scope.setEnvironment({ SESSION_LOG_DIR: undefined });
+  });
 
   await t.test("debug level 1 omits tool arguments and errors", async () => {
     scope.setEnvironment({ DEBUG: "1" });
@@ -436,21 +525,24 @@ test("software-development team runs against a safe workspace and mocked GitHub"
       assert.doesNotMatch(invalidInputTrace, /jwt-raw-sentinel/);
 
       const eventsBeforeDelegateFailure = debugEvents.length;
-      const delegateFailure = await debugChat.start({
-        message: "DEBUG_DELEGATE_MODEL_FAILURE",
-        principalId: "debug-user",
+      const modelRequestsBeforeDelegateFailure = modelRequestCount;
+      const delegateFailureResponse = await fetch(`${debugApiOrigin}/chat`, {
+        body: JSON.stringify({
+          message: "DEBUG_DELEGATE_MODEL_FAILURE",
+          principalId: "debug-user",
+          team: "software-development",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
       });
-      assert.equal(delegateFailure.text, "Development-team handoff complete.");
+      assert.equal(delegateFailureResponse.status, 400);
+      assert.equal(modelRequestCount, modelRequestsBeforeDelegateFailure + 2);
       const delegateFailureTrace = debugEvents
         .slice(eventsBeforeDelegateFailure)
         .join("\n");
       assert.match(
         delegateFailureTrace,
         /lead: delegated agent model returned an error response \(200\)\./
-      );
-      assert.match(
-        delegateFailureTrace,
-        /lead: tool delegate error Delegated agent model returned an error response \(200\)\./
       );
       assert.doesNotMatch(delegateFailureTrace, /delegated-model-sentinel/);
 
@@ -495,6 +587,30 @@ test("software-development team runs against a safe workspace and mocked GitHub"
           .includes("lead: model request timed out")
       );
       scope.setEnvironment({ MODEL_TIMEOUT_MS: undefined });
+
+      const continuationSession = await debugChat.start({
+        message: "REVIEW E2E",
+        principalId: "debug-user",
+      });
+      scope.setEnvironment({ MODEL_TIMEOUT_MS: "10" });
+      const modelRequestsBeforeDelegateTimeout = modelRequestCount;
+      const delegateTimeoutResponse = await fetch(`${debugApiOrigin}/chat`, {
+        body: JSON.stringify({
+          message: "DEBUG_DELEGATE_TIMEOUT",
+          sessionId: continuationSession.sessionId,
+          team: "software-development",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      assert.equal(delegateTimeoutResponse.status, 400);
+      assert.equal(modelRequestCount, modelRequestsBeforeDelegateTimeout + 2);
+      scope.setEnvironment({ MODEL_TIMEOUT_MS: undefined });
+      const continued = await debugChat.continue({
+        message: "REVIEW E2E",
+        sessionId: continuationSession.sessionId,
+      });
+      assert.equal(continued.text, "Development-team handoff complete.");
 
       const eventsBeforeRemoteFailure = debugEvents.length;
       githubFailure = true;
@@ -579,6 +695,31 @@ test("software-development team runs against a safe workspace and mocked GitHub"
       if (!(createFile && replaceFile)) {
         throw new Error("Expected workspace write tools to be available.");
       }
+      assert.ok(
+        !tools.some((tool) =>
+          [
+            "get_workspace_git_status",
+            "github_create_pull_request",
+            "github_get_pull_request",
+          ].includes(tool.name)
+        )
+      );
+
+      const gitStatus = createSoftwareDevelopmentTools({
+        agent: "backend-engineer",
+        delegate: async () => ({}),
+        loadSkill: async () => "",
+        principalId: "backend-user",
+        requestApproval: () => ({ approvalId: "approval-id", message: "" }),
+        specialists: ["backend-engineer"],
+      }).find((tool) => tool.name === "get_workspace_git_status");
+      if (!gitStatus) {
+        throw new Error("Expected get_workspace_git_status to be available.");
+      }
+      assert.deepEqual(await gitStatus.run({}), {
+        available: false,
+        reason: "The approved workspace is not a Git repository.",
+      });
 
       await assert.rejects(
         createFile.run({

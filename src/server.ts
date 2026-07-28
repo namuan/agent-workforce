@@ -13,6 +13,8 @@ const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "127.0.0.1";
 const isLoopback = ["127.0.0.1", "::1", "localhost"].includes(host);
 const apiToken = process.env.API_TOKEN;
+const sessionIdPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const environmentDebug: DebugLogger | undefined = debugEnabled()
   ? (message) => process.stderr.write(`[debug] ${message}\n`)
   : undefined;
@@ -77,8 +79,18 @@ export const createAppServer = (
         sessionId?: string;
         team?: string;
       };
+      if (
+        body.sessionId !== undefined &&
+        (typeof body.sessionId !== "string" ||
+          !sessionIdPattern.test(body.sessionId))
+      ) {
+        throw new Error("A valid session ID is required.");
+      }
       const sessionId = body.sessionId ?? randomUUID();
       const existing = sessions.get(sessionId);
+      if (body.sessionId !== undefined && !existing) {
+        throw new Error("Unknown or expired session.");
+      }
       const session =
         existing ??
         createSession(
@@ -86,7 +98,11 @@ export const createAppServer = (
             ? (body.principalId ?? "local-user")
             : (process.env.PRINCIPAL_ID ?? "api-user"),
           teamFrom(body.team),
-          options.debug ?? environmentDebug
+          options.debug ?? environmentDebug,
+          undefined,
+          undefined,
+          undefined,
+          sessionId
         );
       if (existing && body.team !== undefined && session.team !== body.team) {
         throw new Error("A session cannot switch teams.");

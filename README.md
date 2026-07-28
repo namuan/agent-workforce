@@ -24,9 +24,9 @@ The runtime does not choose a fixed sequence of agents. The model chooses from t
 2. The runtime records the session's team and principal. An HTTP session cannot change teams. The HTTP server accepts unauthenticated requests only when it binds to a loopback address. A non-loopback server requires `API_TOKEN` and takes the principal from `PRINCIPAL_ID`.
 3. The runtime validates the team id, resolves `teams/<team-id>/`, rejects unsafe paths and symlinks, and loads that team's `team.ts` registry. The registry supplies the specialist list, delegation guidance, and a tool factory.
 4. The runtime builds the lead's system prompt from the team's `instructions.md`, the specialist descriptions, and the delegation guidance. It creates only the lead's tools and sends the prompt, session history, user message, and JSON schemas for those tools to the configured OpenAI-compatible `POST /chat/completions` endpoint.
-5. The model either returns text or requests one or more tool calls. For each tool call, the runtime parses its JSON arguments, runs the matching narrow tool, and adds the tool result to the conversation. Tool failures become tool results for the model to handle. The loop allows at most 12 model turns.
+5. The model either returns text or requests one or more tool calls. For each tool call, the runtime parses its JSON arguments, runs the matching narrow tool, and adds the tool result to the conversation. Ordinary tool failures become tool results for the model to handle. A terminal delegated-specialist failure stops the request. The loop allows at most 12 model turns.
 6. A lead can call `delegate`. The runtime then starts the requested specialist in a fresh session with the delegation brief as its only task context. The specialist gets its own `instructions.md`, tools, and list of available Markdown skills. It can call `load_skill` to read a `SKILL.md` or a safe reference file before acting.
-7. Specialist tools read or change only the resources their team exposes. For example, marketing tools use `.data/` and configured service APIs. Software-development tools stay inside `DEV_WORKSPACE_DIR`, reject traversal and symlink escapes, and expose no general shell. New files are limited to the workspace root. File creation and replacement need approval. The specialist's final result becomes the `delegate` tool result for the lead.
+7. Specialist tools read or change only the resources their team exposes. For example, marketing tools use `.data/` and configured service APIs. Software-development tools stay inside `DEV_WORKSPACE_DIR`, reject traversal and symlink escapes, and expose no general shell. Workspace paths are relative, such as `snake.html`, not `/workspace/snake.html`. New files are limited to the workspace root. File creation and replacement need approval. The specialist's final result becomes the `delegate` tool result for the lead.
 8. A tool that needs consent does not act immediately. It stores the exact deferred action in the session, generates a single-use approval id, and returns a description. The action expires after 10 minutes. No external write happens before approval.
 9. You approve the action with `/approve <id>` in the CLI or by posting the returned `sessionId` and `approvalId` to `/chat`. The runtime runs the saved action, adds its result to the original tool call, and resumes the lead so it can report the confirmed outcome without repeating the action.
 10. The HTTP API retains session history and pending approvals only in memory. Restarting the process removes them. The CLI retains its session only until you exit.
@@ -54,11 +54,13 @@ pnpm install
 TEAM=marketing pnpm dev
 ```
 
-Run the software-development example with an approved repository worktree:
+Run the software-development example with an approved workspace:
 
 ```bash
 TEAM=software-development DEV_WORKSPACE_DIR=/absolute/path/to/worktree pnpm dev
 ```
+
+The workspace does not need to be a Git repository. The Git-status tool reports that Git is unavailable when it is not one.
 
 The default model endpoint matches the prior local setup:
 
@@ -86,6 +88,14 @@ DEBUG=1 TEAM=software-development DEV_WORKSPACE_DIR=/absolute/path/to/worktree p
 Set `DEBUG=2` when you need to diagnose a tool failure. It includes sanitized declared scalar tool arguments, safe model and delegated-agent failure categories, and a failure detail. Credential-like fields are redacted, undeclared and nested arguments are omitted, and remote response bodies or structured error payloads are omitted. Do not use it where the remaining file paths or scalar arguments would be sensitive.
 
 The HTTP server writes the same trace to standard error when started with either debug level.
+
+## Session logs
+
+Every session writes one JSON Lines file. By default, files are stored in `.data/session-logs/<session-id>.jsonl`. Set `SESSION_LOG_DIR` to use another central location.
+
+The file records user messages, lead and specialist activity, model requests and raw responses, tool calls and results, approvals, and terminal errors. It does not record `MODEL_API_KEY`, HTTP request headers, or credentials embedded in the configured model endpoint. Logs may contain sensitive user and workspace data, so log files use owner-only permissions and must not be committed or shared without review. Logs are retained until you remove them.
+
+Logging is best effort. A write failure does not stop a request, but `DEBUG=1` or `DEBUG=2` reports it with a `[log]` line.
 
 ## HTTP API
 

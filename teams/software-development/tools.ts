@@ -13,6 +13,14 @@ const implementationSpecialists = new Set([
   "frontend-engineer",
   "test-engineer",
 ]);
+const frontendTools = new Set([
+  "create_workspace_file",
+  "list_workspace_files",
+  "load_skill",
+  "read_workspace_file",
+  "run_workspace_check",
+  "write_workspace_file",
+]);
 
 const schema = (
   properties: Record<string, unknown>,
@@ -258,7 +266,7 @@ export const createSoftwareDevelopmentTools = (
     },
     {
       description:
-        "Read a UTF-8 file inside the approved development workspace.",
+        "Read a UTF-8 file inside the approved development workspace. Paths must be relative to that workspace, for example snake.html, never /workspace/snake.html.",
       name: "read_workspace_file",
       parameters: schema(
         { path: stringSchema("Relative workspace path.", 500) },
@@ -276,7 +284,7 @@ export const createSoftwareDevelopmentTools = (
     },
     {
       description:
-        "Propose replacing one existing workspace file. This always requires approval and cannot create files or leave the approved workspace.",
+        "Propose replacing one existing workspace file. Use a relative path, for example snake.html, never /workspace/snake.html. This always requires approval and cannot create files or leave the approved workspace.",
       name: "write_workspace_file",
       parameters: schema(
         {
@@ -305,7 +313,7 @@ export const createSoftwareDevelopmentTools = (
     },
     {
       description:
-        "Propose creating one new file in the workspace root. This always requires approval, cannot overwrite a file, and cannot leave the approved workspace.",
+        "Propose creating one new file in the workspace root. Use a relative filename, for example snake.html. This always requires approval, cannot overwrite a file, and cannot leave the approved workspace.",
       name: "create_workspace_file",
       parameters: schema(
         {
@@ -345,12 +353,26 @@ export const createSoftwareDevelopmentTools = (
       parameters: schema({}),
       run: async () => {
         const root = await workspaceRoot();
-        const result = await execFileAsync("git", ["status", "--short"], {
-          cwd: root,
-          env: { CI: "1", HOME: root, PATH: process.env.PATH ?? "" },
-          maxBuffer: maxOutputLength,
-        });
-        return { status: result.stdout.slice(0, maxOutputLength) };
+        try {
+          const result = await execFileAsync("git", ["status", "--short"], {
+            cwd: root,
+            env: { CI: "1", HOME: root, PATH: process.env.PATH ?? "" },
+            maxBuffer: maxOutputLength,
+          });
+          return {
+            available: true,
+            status: result.stdout.slice(0, maxOutputLength),
+          };
+        } catch (error) {
+          const failure = error as { stderr?: string };
+          if (failure.stderr?.includes("not a git repository")) {
+            return {
+              available: false,
+              reason: "The approved workspace is not a Git repository.",
+            };
+          }
+          throw error;
+        }
       },
     },
     {
@@ -451,6 +473,9 @@ export const createSoftwareDevelopmentTools = (
         return delegate(specialist, text(value, "brief"));
       },
     });
+  }
+  if (agent === "frontend-engineer") {
+    return tools.filter((tool) => frontendTools.has(tool.name));
   }
   if (implementationSpecialists.has(agent)) {
     return tools;
