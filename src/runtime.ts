@@ -206,6 +206,21 @@ const requestApproval = (
   };
 };
 
+const pendingApprovalResult = (session: Session): ChatResult | undefined => {
+  for (const [approvalId, pending] of session.pendingApprovals) {
+    if (Date.now() > pending.expiresAt) {
+      session.pendingApprovals.delete(approvalId);
+      return {
+        text: "That approval request expired. Ask the agent to prepare it again.",
+      };
+    }
+    return {
+      approvalId,
+      text: `${pending.description} Approval required. Type /approve ${approvalId} to continue.`,
+    };
+  }
+};
+
 const runAgent = async (
   team: LoadedTeam,
   agent: string,
@@ -310,6 +325,7 @@ export const chat = async (
   session: Session,
   message: string
 ): Promise<ChatResult> =>
+  pendingApprovalResult(session) ??
   runAgent(await loadTeam(session.team), "lead", session, message);
 
 export const approve = async (

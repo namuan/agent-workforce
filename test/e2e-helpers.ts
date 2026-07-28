@@ -129,6 +129,8 @@ export const createChatClient = (origin: string, team: string) => {
   return {
     approve: async (approval: { approvalId: string; sessionId: string }) =>
       request(approval),
+    continue: async (input: { message: string; sessionId: string }) =>
+      request({ ...input, team }),
     start: async (input: { message: string; principalId: string }) =>
       request({ ...input, team }),
   };

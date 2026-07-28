@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { open, readdir, readFile, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { Tool, ToolFactoryContext } from "../../src/tools.ts";
 
@@ -78,6 +78,23 @@ const workspacePath = async (path: string): Promise<string> => {
   return target;
 };
 
+const newWorkspacePath = async (path: string): Promise<string> => {
+  if (isAbsolute(path) || path.includes("\0")) {
+    throw new Error("Workspace paths must be relative.");
+  }
+  const root = await workspaceRoot();
+  const target = resolve(root, path);
+  if (relative(root, target).startsWith("..") || target === root) {
+    throw new Error("Workspace paths must stay inside the approved workspace.");
+  }
+  if (dirname(target) !== root) {
+    throw new Error(
+      "New workspace files must be created in the workspace root."
+    );
+  }
+  return target;
+};
+
 const replaceWorkspaceFile = async (
   path: string,
   content: string
@@ -90,6 +107,25 @@ const replaceWorkspaceFile = async (
     if (!(await handle.stat()).isFile()) {
       throw new Error("Workspace writes must target a regular file.");
     }
+    await handle.writeFile(content, "utf8");
+  } finally {
+    await handle.close();
+  }
+};
+
+const createWorkspaceFile = async (
+  path: string,
+  content: string
+): Promise<void> => {
+  const target = await newWorkspacePath(path);
+  const flags =
+    // biome-ignore lint/suspicious/noBitwiseOperators: POSIX open flags must be combined bitwise.
+    constants.O_WRONLY |
+    constants.O_CREAT |
+    constants.O_EXCL |
+    constants.O_NOFOLLOW;
+  const handle = await open(target, flags, 0o600);
+  try {
     await handle.writeFile(content, "utf8");
   } finally {
     await handle.close();
@@ -268,6 +304,31 @@ export const createSoftwareDevelopmentTools = (
     },
     {
       description:
+        "Propose creating one new file in the workspace root. This always requires approval, cannot overwrite a file, and cannot leave the approved workspace.",
+      name: "create_workspace_file",
+      parameters: schema(
+        {
+          content: stringSchema("Complete new file content.", maxFileLength),
+          path: stringSchema(
+            "New relative filename in the workspace root.",
+            500
+          ),
+        },
+        ["path", "content"]
+      ),
+      run: async (input) => {
+        const value = object(input);
+        const path = text(value, "path", 500);
+        const content = text(value, "content", maxFileLength);
+        await newWorkspacePath(path);
+        return approval(context, `Create workspace file ${path}.`, async () => {
+          await createWorkspaceFile(path, content);
+          return { created: true, path };
+        });
+      },
+    },
+    {
+      description:
         "Run one allowlisted workspace check: lint, typecheck, or test. No arbitrary shell commands are available.",
       name: "run_workspace_check",
       parameters: schema(
@@ -398,6 +459,7 @@ export const createSoftwareDevelopmentTools = (
       ![
         "github_create_pull_request",
         "run_workspace_check",
+        "create_workspace_file",
         "write_workspace_file",
       ].includes(tool.name)
   );

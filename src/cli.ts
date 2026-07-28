@@ -1,5 +1,6 @@
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
+import { parseCliCommand } from "./cli-command.ts";
 import { approve, chat, createSession } from "./runtime.ts";
 
 const team = process.env.TEAM;
@@ -14,14 +15,19 @@ output.write(
 );
 for (;;) {
   const message = await terminal.question("You: ");
-  if (message.trim() === "/exit") {
+  const command = parseCliCommand(message);
+  if (command.type === "exit") {
     break;
   }
   try {
-    const approval = message.match(/^\/approve\s+(.+)$/);
-    const result = approval
-      ? await approve(session, approval[1].trim())
-      : await chat(session, message);
+    if (command.type === "unknown") {
+      output.write("\nError: Unknown command. Use /approve <id> or /exit.\n\n");
+      continue;
+    }
+    const result =
+      command.type === "approve"
+        ? await approve(session, command.approvalId)
+        : await chat(session, command.message);
     output.write(`\nTeam: ${result.text}\n\n`);
   } catch (error) {
     output.write(

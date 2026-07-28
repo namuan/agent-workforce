@@ -14,7 +14,36 @@ Each directory under `teams/` is a self-contained example: prompts, skills, agen
 - Native HTTP calls for public web reading, Notion, Typefully, and Resend.
 - Approval tokens for destructive actions, Typefully scheduling/deletion, Notion updates/deletion, and all Resend sends.
 - A terminal chat loop and a small JSON HTTP API implemented with `node:http`.
-- A software-development team with a tech lead, backend and frontend engineers, test engineer, and code reviewer. Its workspace tools are path-scoped, have no general shell, and require approval before file replacement or pull-request creation.
+- A software-development team with a tech lead, backend and frontend engineers, test engineer, and code reviewer. Its workspace tools are path-scoped, have no general shell, and require approval before creating or replacing a file or creating a pull request.
+
+## How a request runs
+
+The runtime does not choose a fixed sequence of agents. The model chooses from the tools available to the current agent. This is the complete request flow:
+
+1. You start the CLI with `TEAM=<team-id>` or send the first `POST /chat` request with a `team`. The CLI creates one local session. The HTTP API creates a session and returns its `sessionId`.
+2. The runtime records the session's team and principal. An HTTP session cannot change teams. The HTTP server accepts unauthenticated requests only when it binds to a loopback address. A non-loopback server requires `API_TOKEN` and takes the principal from `PRINCIPAL_ID`.
+3. The runtime validates the team id, resolves `teams/<team-id>/`, rejects unsafe paths and symlinks, and loads that team's `team.ts` registry. The registry supplies the specialist list, delegation guidance, and a tool factory.
+4. The runtime builds the lead's system prompt from the team's `instructions.md`, the specialist descriptions, and the delegation guidance. It creates only the lead's tools and sends the prompt, session history, user message, and JSON schemas for those tools to the configured OpenAI-compatible `POST /chat/completions` endpoint.
+5. The model either returns text or requests one or more tool calls. For each tool call, the runtime parses its JSON arguments, runs the matching narrow tool, and adds the tool result to the conversation. Tool failures become tool results for the model to handle. The loop allows at most 12 model turns.
+6. A lead can call `delegate`. The runtime then starts the requested specialist in a fresh session with the delegation brief as its only task context. The specialist gets its own `instructions.md`, tools, and list of available Markdown skills. It can call `load_skill` to read a `SKILL.md` or a safe reference file before acting.
+7. Specialist tools read or change only the resources their team exposes. For example, marketing tools use `.data/` and configured service APIs. Software-development tools stay inside `DEV_WORKSPACE_DIR`, reject traversal and symlink escapes, and expose no general shell. New files are limited to the workspace root. File creation and replacement need approval. The specialist's final result becomes the `delegate` tool result for the lead.
+8. A tool that needs consent does not act immediately. It stores the exact deferred action in the session, generates a single-use approval id, and returns a description. The action expires after 10 minutes. No external write happens before approval.
+9. You approve the action with `/approve <id>` in the CLI or by posting the returned `sessionId` and `approvalId` to `/chat`. The runtime runs the saved action, adds its result to the original tool call, and resumes the lead so it can report the confirmed outcome without repeating the action.
+10. The HTTP API retains session history and pending approvals only in memory. Restarting the process removes them. The CLI retains its session only until you exit.
+
+### Example software-development request
+
+Suppose you run the CLI with an approved worktree and ask: 'Change the default value in `src/config.ts` from `false` to `true`, then type-check the project.' The request can run as follows:
+
+1. You start `TEAM=software-development DEV_WORKSPACE_DIR=/absolute/path/to/worktree pnpm dev`. The CLI creates a session for the software-development team. `DEV_WORKSPACE_DIR` is the only workspace its tools can use.
+2. The software-development lead receives your request. It does not edit code. It may inspect the workspace or ask for missing acceptance criteria, then calls `delegate` with a complete brief for the backend engineer.
+3. The backend engineer starts with a fresh session. It reads its instructions, loads the engineering skill, and reads `src/config.ts` through `read_workspace_file`. It cannot use a shell or read files outside the approved worktree.
+4. If the engineer confirms the change, it calls `write_workspace_file` with the existing relative path and the complete replacement content. The runtime does not write the file. It returns an approval id and a summary such as 'Replace workspace file src/config.ts.'
+5. You review that summary and enter `/approve <approval-id>`. The runtime uses the saved action to verify that the path is still inside the worktree, is not a symlink, and is a regular existing file. It then replaces that file only.
+6. The runtime adds the confirmed write result to the lead's conversation and asks the lead to continue. The lead can delegate again, for example to the test engineer, which can run only `pnpm run check`, `pnpm run typecheck`, or `pnpm test` through `run_workspace_check`.
+7. The lead returns the recorded tool output. It can say that the file changed only after approval. It can say that type-checking passed only if the check tool returned a successful result. If a check did not run or failed, it must say so.
+
+The model decides whether to inspect, delegate, run an allowlisted check, or ask a question at each point. The runtime enforces the workspace boundary, tool input validation, approval pause, and 12-turn limit regardless of the model's choice.
 
 ## Run locally
 
@@ -48,7 +77,7 @@ pnpm start
 curl http://localhost:3000/health
 curl -X POST http://localhost:3000/chat \
   -H 'content-type: application/json' \
-  -d '{"principalId":"alex","message":"Help me sharpen our positioning"}'
+  -d '{"team":"marketing","principalId":"alex","message":"Help me sharpen our positioning"}'
 ```
 
 Pass the returned `sessionId` to retain conversation state. To approve an action, post `{ "sessionId": "...", "approvalId": "..." }` to the same endpoint. The server binds to `127.0.0.1` by default. Setting `HOST` to a non-loopback address requires `API_TOKEN`; send it as `Authorization: Bearer <API_TOKEN>`. In that mode, identity comes from `PRINCIPAL_ID`, never from request JSON.
