@@ -1,0 +1,24 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "extends": ["ultracite/biome/core"],
+  "linter": {
+    "rules": {
+      "style": {
+        "useDestructuring": "off",
+        "noNestedTernary": "off"
+      },
+      // Agent loops intentionally await model/tool turns in sequence. Tool adapters also compose
+      // promise-returning fetch helpers and construct regexes from runtime configuration.
+      "complexity": {
+        "noExcessiveCognitiveComplexity": "off"
+      },
+      "performance": {
+        "noAwaitInLoops": "off",
+        "useTopLevelRegex": "off"
+      },
+      "suspicious": {
+        "useAwait": "off"
+      }
+    }
+  }
+}

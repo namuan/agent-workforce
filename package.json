@@ -1,0 +1,24 @@
+{
+  "name": "agent-workforce",
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm run typecheck",
+    "dev": "node --experimental-strip-types src/cli.ts",
+    "start": "node --experimental-strip-types src/server.ts",
+    "test:e2e": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc",
+    "check": "ultracite check src test teams",
+    "fix": "ultracite fix src test teams",
+    "validate": "pnpm run check && pnpm run typecheck"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.3",
+    "@types/node": "~24.13.3",
+    "typescript": "7.0.2",
+    "ultracite": "^7.9.4"
+  },
+  "engines": {
+    "node": "24.x"
+  }
+}

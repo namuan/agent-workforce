@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.template
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime data and generated output
+.data/
+dist/
+coverage/
+*.tsbuildinfo
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Local tooling and operating-system files
+.DS_Store
+.idea/
+.vscode/
