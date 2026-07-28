@@ -1,14 +1,18 @@
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { parseCliCommand } from "./cli-command.ts";
-import { approve, chat, createSession } from "./runtime.ts";
+import { approve, chat, createSession, debugEnabled } from "./runtime.ts";
 
 const team = process.env.TEAM;
 if (!team) {
   throw new Error("Set TEAM to a team directory name before starting the CLI.");
 }
-const session = createSession(process.env.PRINCIPAL_ID ?? "local-user", team);
 const terminal = createInterface({ input, output });
+const session = createSession(
+  process.env.PRINCIPAL_ID ?? "local-user",
+  team,
+  debugEnabled() ? (message) => output.write(`[debug] ${message}\n`) : undefined
+);
 
 output.write(
   `${team} team ready. Type /exit to quit. Approvals use /approve <id>.\n\n`

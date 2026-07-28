@@ -23,6 +23,21 @@ const modelResponse = (messages: ModelMessage[]): unknown => {
   const request = originalUserMessage(messages);
 
   if (system.includes("You lead a software-development team.")) {
+    if (request.includes("DEBUG_TOOL_NAME_SENTINEL")) {
+      if (hasToolResult) {
+        return { choices: [{ message: { content: "Debug complete." } }] };
+      }
+      return {
+        choices: [
+          {
+            message: {
+              content: null,
+              tool_calls: [toolCall("debug-tool-name-sentinel", {})],
+            },
+          },
+        ],
+      };
+    }
     if (hasDelegated) {
       return {
         choices: [
@@ -171,6 +186,11 @@ test("software-development team runs against a safe workspace and mocked GitHub"
   const { createAppServer } = await import("../src/server.ts");
   const apiOrigin = await scope.start(createAppServer());
   const chat = createChatClient(apiOrigin, "software-development");
+  const debugEvents: string[] = [];
+  const debugApiOrigin = await scope.start(
+    createAppServer({ debug: (message) => debugEvents.push(message) })
+  );
+  const debugChat = createChatClient(debugApiOrigin, "software-development");
 
   await t.test(
     "backend change pauses before replacing a workspace file",
@@ -188,6 +208,68 @@ test("software-development team runs against a safe workspace and mocked GitHub"
       assert.equal(
         await readFile(join(workspaceDirectory, "src", "service.ts"), "utf8"),
         "export const enabled = true;\n"
+      );
+    }
+  );
+
+  await t.test(
+    "debug traces runtime progress without request or tool data",
+    async () => {
+      const pending = await debugChat.start({
+        message: "IMPLEMENT DEBUG",
+        principalId: "debug-user",
+      });
+      expectApproval(pending);
+      assert.ok(debugEvents.includes("lead: loading team"));
+      assert.ok(debugEvents.includes("lead: delegating"));
+      assert.ok(
+        debugEvents.includes(
+          "backend-engineer: running tool read_workspace_file"
+        )
+      );
+      assert.ok(
+        debugEvents.includes(
+          "backend-engineer: tool write_workspace_file awaits approval"
+        )
+      );
+      assert.ok(
+        !debugEvents.some(
+          (event) =>
+            event.includes("IMPLEMENT DEBUG") ||
+            event.includes("enabled = true")
+        )
+      );
+
+      const eventsBeforeUnknownTool = debugEvents.length;
+      const debugResult = await debugChat.start({
+        message: "DEBUG_TOOL_NAME_SENTINEL",
+        principalId: "debug-user",
+      });
+      assert.equal(debugResult.text, "Debug complete.");
+      const unknownToolEvents = debugEvents.slice(eventsBeforeUnknownTool);
+      assert.ok(unknownToolEvents.includes("lead: running tool unknown tool"));
+      assert.ok(
+        !unknownToolEvents.some((event) =>
+          event.includes("debug-tool-name-sentinel")
+        )
+      );
+
+      const eventsBeforeUnknownTeam = debugEvents.length;
+      const unknownTeam = "debug-team-secret";
+      const unknownTeamResponse = await fetch(`${debugApiOrigin}/chat`, {
+        body: JSON.stringify({
+          message: "Inspect the workspace",
+          principalId: "debug-user",
+          team: unknownTeam,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      assert.equal(unknownTeamResponse.status, 400);
+      assert.ok(
+        !debugEvents
+          .slice(eventsBeforeUnknownTeam)
+          .some((event) => event.includes(unknownTeam))
       );
     }
   );

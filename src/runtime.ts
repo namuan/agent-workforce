@@ -7,6 +7,8 @@ import type { Tool } from "./tools.ts";
 
 const maxToolTurns = 12;
 
+export type DebugLogger = (message: string) => void;
+
 interface Message {
   readonly content: string | null;
   readonly role: "assistant" | "system" | "tool" | "user";
@@ -38,6 +40,7 @@ export interface PendingApproval {
 }
 
 export interface Session {
+  readonly debug?: DebugLogger;
   readonly history: Message[];
   readonly id: string;
   readonly pendingApprovals: Map<string, PendingApproval>;
@@ -50,13 +53,25 @@ export interface ChatResult {
   readonly text: string;
 }
 
-export const createSession = (principalId: string, team: string): Session => ({
+export const debugEnabled = (): boolean =>
+  ["1", "true"].includes(process.env.DEBUG?.toLowerCase() ?? "");
+
+export const createSession = (
+  principalId: string,
+  team: string,
+  debug?: DebugLogger
+): Session => ({
+  debug,
   history: [],
   id: randomUUID(),
   pendingApprovals: new Map(),
   principalId,
   team,
 });
+
+const logDebug = (session: Session, message: string): void => {
+  session.debug?.(message);
+};
 
 const readText = async (path: string): Promise<string> =>
   readFile(path, "utf8");
@@ -200,6 +215,7 @@ const requestApproval = (
     description,
     expiresAt: Date.now() + 10 * 60 * 1000,
   });
+  logDebug(session, "approval: requested");
   return {
     approvalId,
     message: `${description} Approval required. Type /approve ${approvalId} to continue.`,
@@ -227,6 +243,7 @@ const runAgent = async (
   session: Session,
   message: string
 ): Promise<ChatResult> => {
+  logDebug(session, `${agent}: started`);
   const tools = team.definition.createTools({
     agent,
     delegate: async (specialist, brief) =>
@@ -237,6 +254,10 @@ const runAgent = async (
       requestApproval(session, description, action),
     specialists: Object.keys(team.definition.agents),
   });
+  logDebug(
+    session,
+    `${agent}: tools ready (${tools.map((tool) => tool.name).join(", ")})`
+  );
   const messages: Message[] = [
     { content: await systemPrompt(team, agent), role: "system" },
     ...session.history,
@@ -246,6 +267,7 @@ const runAgent = async (
     session.history.push({ content: message, role: "user" });
   }
   for (let turn = 0; turn < maxToolTurns; turn += 1) {
+    logDebug(session, `${agent}: model turn ${turn + 1}`);
     const response = await modelRequest(messages, tools);
     const choice = response.choices?.[0]?.message;
     if (!choice) {
@@ -262,12 +284,15 @@ const runAgent = async (
       session.history.push(assistantMessage);
     }
     if (calls.length === 0) {
+      logDebug(session, `${agent}: completed`);
       return { text: choice.content?.trim() || "Done." };
     }
     for (const call of calls) {
       const tool = tools.find(
         (candidate) => candidate.name === call.function.name
       );
+      const toolName = tool?.name ?? "unknown tool";
+      logDebug(session, `${agent}: running tool ${toolName}`);
       let value: unknown;
       try {
         value = tool
@@ -288,6 +313,7 @@ const runAgent = async (
             toolCallId: call.id,
           });
         }
+        logDebug(session, `${agent}: tool ${toolName} awaits approval`);
         return {
           approvalId,
           text: String(
@@ -295,6 +321,12 @@ const runAgent = async (
           ),
         };
       }
+      logDebug(
+        session,
+        typeof value === "object" && value && "error" in value
+          ? `${agent}: tool ${toolName} failed`
+          : `${agent}: tool ${toolName} completed`
+      );
       const toolMessage = asToolMessage(call.id, value);
       messages.push(toolMessage);
       if (agent === "lead") {
@@ -311,11 +343,12 @@ const delegate = async (
   brief: string,
   parent: Session
 ): Promise<unknown> => {
-  if (!team.definition.agents[specialist]) {
+  if (!Object.hasOwn(team.definition.agents, specialist)) {
     throw new Error("Unknown specialist.");
   }
+  logDebug(parent, "lead: delegating");
   const child: Session = {
-    ...createSession(parent.principalId, parent.team),
+    ...createSession(parent.principalId, parent.team, parent.debug),
     pendingApprovals: parent.pendingApprovals,
   };
   return runAgent(team, specialist, child, brief);
@@ -324,9 +357,15 @@ const delegate = async (
 export const chat = async (
   session: Session,
   message: string
-): Promise<ChatResult> =>
-  pendingApprovalResult(session) ??
-  runAgent(await loadTeam(session.team), "lead", session, message);
+): Promise<ChatResult> => {
+  const pending = pendingApprovalResult(session);
+  if (pending) {
+    logDebug(session, "lead: chat blocked by pending approval");
+    return pending;
+  }
+  logDebug(session, "lead: loading team");
+  return runAgent(await loadTeam(session.team), "lead", session, message);
+};
 
 export const approve = async (
   session: Session,
@@ -334,17 +373,21 @@ export const approve = async (
 ): Promise<ChatResult> => {
   const pending = session.pendingApprovals.get(approvalId);
   if (!pending) {
+    logDebug(session, "approval: missing or already used");
     return {
       text: "That approval request is missing or has already been used.",
     };
   }
   session.pendingApprovals.delete(approvalId);
   if (Date.now() > pending.expiresAt) {
+    logDebug(session, "approval: expired");
     return {
       text: "That approval request expired. Ask the agent to prepare it again.",
     };
   }
+  logDebug(session, "approval: executing saved action");
   const result = await pending.action();
+  logDebug(session, "approval: action completed");
   if (!pending.toolCallId) {
     return {
       text: `${pending.description}\n\n${JSON.stringify(result, null, 2)}`,

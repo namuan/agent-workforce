@@ -70,6 +70,16 @@ MODEL_API_KEY=optional-token
 
 The CLI accepts `/exit`. When an action needs consent, it returns a token; run `/approve <token>` to perform that exact pending action. Tokens expire after 10 minutes.
 
+## Debug processing
+
+Set `DEBUG=1` to print a live trace while the runtime handles each request:
+
+```bash
+DEBUG=1 TEAM=software-development DEV_WORKSPACE_DIR=/absolute/path/to/worktree pnpm dev
+```
+
+The trace reports agent starts, model turns, tool names, delegation, approval pauses, and completion. It does not print prompts, user messages, tool arguments, tool output, or credentials. The HTTP server writes the same trace to standard error when started with `DEBUG=1`.
+
 ## HTTP API
 
 ```bash

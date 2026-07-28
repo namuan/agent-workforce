@@ -1,11 +1,21 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
-import { approve, chat, createSession, type Session } from "./runtime.ts";
+import {
+  approve,
+  chat,
+  createSession,
+  type DebugLogger,
+  debugEnabled,
+  type Session,
+} from "./runtime.ts";
 
 const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "127.0.0.1";
 const isLoopback = ["127.0.0.1", "::1", "localhost"].includes(host);
 const apiToken = process.env.API_TOKEN;
+const environmentDebug: DebugLogger | undefined = debugEnabled()
+  ? (message) => process.stderr.write(`[debug] ${message}\n`)
+  : undefined;
 
 const teamFrom = (value: unknown): string => {
   if (typeof value === "string" && /^[a-z][a-z0-9-]{0,62}$/.test(value)) {
@@ -42,7 +52,9 @@ const readBody = async (
   return JSON.parse(body || "{}");
 };
 
-export const createAppServer = () => {
+export const createAppServer = (
+  options: { readonly debug?: DebugLogger } = {}
+) => {
   const sessions = new Map<string, Session>();
   return createServer(async (request, response) => {
     response.setHeader("content-type", "application/json");
@@ -73,7 +85,8 @@ export const createAppServer = () => {
           isLoopback
             ? (body.principalId ?? "local-user")
             : (process.env.PRINCIPAL_ID ?? "api-user"),
-          teamFrom(body.team)
+          teamFrom(body.team),
+          options.debug ?? environmentDebug
         );
       if (existing && body.team !== undefined && session.team !== body.team) {
         throw new Error("A session cannot switch teams.");
