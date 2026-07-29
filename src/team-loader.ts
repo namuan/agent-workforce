@@ -47,7 +47,13 @@ const isTeamModule = (value: unknown): value is TeamModule => {
     typeof team.leadDelegationGuidance === "string" &&
     typeof team.createTools === "function" &&
     Boolean(team.agents) &&
-    typeof team.agents === "object"
+    typeof team.agents === "object" &&
+    (team.failureAnalysisAgent === undefined ||
+      typeof team.failureAnalysisAgent === "string") &&
+    (team.maxFailureRecoveryAttempts === undefined ||
+      (Number.isInteger(team.maxFailureRecoveryAttempts) &&
+        team.maxFailureRecoveryAttempts >= 0 &&
+        team.maxFailureRecoveryAttempts <= 3))
   );
 };
 

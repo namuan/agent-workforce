@@ -20,15 +20,49 @@ const modelResponse = (messages: ModelMessage[]): unknown => {
   const hasDelegated = messages.some((message) =>
     message.tool_calls?.some((call) => call.function.name === "delegate")
   );
+  const latestUserMessage = messages.reduce(
+    (index, message, currentIndex) =>
+      message.role === "user" ? currentIndex : index,
+    -1
+  );
+  const hasDelegatedForLatestRequest = messages
+    .slice(latestUserMessage + 1)
+    .some((message) =>
+      message.tool_calls?.some((call) => call.function.name === "delegate")
+    );
   const hasDelegateTimeout = messages.some(
     (message) =>
       message.role === "user" &&
       message.content?.includes("DEBUG_DELEGATE_TIMEOUT")
   );
+  const hasFailureRecovery = messages.some(
+    (message) =>
+      message.role === "user" &&
+      message.content?.includes(
+        "Retry the original task after failure analysis"
+      )
+  );
   const request = originalUserMessage(messages);
 
+  if (system.includes("You are the failure analyst.")) {
+    return {
+      choices: [
+        {
+          message: {
+            content:
+              "Likely reason: The model endpoint did not return headers after the specialist received tool output.\n\nNext try: Retry with a fresh focused delegation and avoid repeating unchanged context.",
+          },
+        },
+      ],
+    };
+  }
+
   if (system.includes("You lead a software-development team.")) {
-    if (hasDelegateTimeout) {
+    if (
+      hasDelegateTimeout &&
+      !hasDelegatedForLatestRequest &&
+      !hasFailureRecovery
+    ) {
       return {
         choices: [
           {
@@ -145,6 +179,11 @@ const modelResponse = (messages: ModelMessage[]): unknown => {
     system.includes("You are the backend engineer.") ||
     system.includes("You are the frontend engineer.")
   ) {
+    if (request.includes("DEBUG_DELEGATE_TIMEOUT")) {
+      return {
+        choices: [{ message: { content: "Timed-out delegation retried." } }],
+      };
+    }
     if (request.includes("DEBUG_DELEGATE_MODEL_FAILURE")) {
       return { error: { message: "delegated-model-sentinel" } };
     }
@@ -265,11 +304,24 @@ test("software-development team runs against a safe workspace and mocked GitHub"
   );
 
   let modelRequestCount = 0;
+  let retryRetainedFailedRequest = false;
+  const systemPrompts: string[] = [];
   const model = createModelMock<{ messages: ModelMessage[] }>(
     async ({ messages }) => {
       modelRequestCount += 1;
       const request = originalUserMessage(messages);
       const system = messages[0]?.content ?? "";
+      systemPrompts.push(system);
+      const latestUserMessage = [...messages]
+        .reverse()
+        .find((message) => message.role === "user")?.content;
+      if (latestUserMessage === "Try again") {
+        retryRetainedFailedRequest = messages.some(
+          (message) =>
+            message.role === "user" &&
+            message.content?.includes("DEBUG_DELEGATE_TIMEOUT")
+        );
+      }
       if (
         request.includes("DEBUG_MODEL_TIMEOUT") ||
         (messages.some(
@@ -366,7 +418,12 @@ test("software-development team runs against a safe workspace and mocked GitHub"
       .map(
         (line) =>
           JSON.parse(line) as {
-            details?: { body?: { messages?: unknown[] } };
+            details?: {
+              agent?: string;
+              body?: { messages?: unknown[] };
+              durationMs?: number;
+              status?: number;
+            };
             event: string;
             sessionId: string;
           }
@@ -376,6 +433,7 @@ test("software-development team runs against a safe workspace and mocked GitHub"
       "user_message",
       "agent_started",
       "model_request",
+      "model_response_headers",
       "model_response",
       "tool_call",
       "tool_result",
@@ -388,6 +446,15 @@ test("software-development team runs against a safe workspace and mocked GitHub"
         (record) =>
           record.event === "model_request" &&
           Array.isArray(record.details?.body?.messages)
+      )
+    );
+    assert.ok(
+      records.some(
+        (record) =>
+          record.event === "model_response_headers" &&
+          record.details?.agent === "lead" &&
+          record.details.status === 200 &&
+          typeof record.details.durationMs === "number"
       )
     );
     assert.equal((await stat(logDirectory)).mode % 0o1000, 0o700);
@@ -536,7 +603,7 @@ test("software-development team runs against a safe workspace and mocked GitHub"
         method: "POST",
       });
       assert.equal(delegateFailureResponse.status, 400);
-      assert.equal(modelRequestCount, modelRequestsBeforeDelegateFailure + 2);
+      assert.ok(modelRequestCount > modelRequestsBeforeDelegateFailure + 2);
       const delegateFailureTrace = debugEvents
         .slice(eventsBeforeDelegateFailure)
         .join("\n");
@@ -588,6 +655,10 @@ test("software-development team runs against a safe workspace and mocked GitHub"
       );
       scope.setEnvironment({ MODEL_TIMEOUT_MS: undefined });
 
+      const timeoutLogDirectory = await scope.temporaryDirectory(
+        "timeout-session-logs-"
+      );
+      scope.setEnvironment({ SESSION_LOG_DIR: timeoutLogDirectory });
       const continuationSession = await debugChat.start({
         message: "REVIEW E2E",
         principalId: "debug-user",
@@ -603,14 +674,61 @@ test("software-development team runs against a safe workspace and mocked GitHub"
         headers: { "content-type": "application/json" },
         method: "POST",
       });
-      assert.equal(delegateTimeoutResponse.status, 400);
-      assert.equal(modelRequestCount, modelRequestsBeforeDelegateTimeout + 2);
+      assert.equal(delegateTimeoutResponse.status, 200);
+      assert.ok(modelRequestCount > modelRequestsBeforeDelegateTimeout + 2);
+      const timeoutRecords = (
+        await readFile(
+          join(timeoutLogDirectory, `${continuationSession.sessionId}.jsonl`),
+          "utf8"
+        )
+      )
+        .trim()
+        .split("\n")
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              details?: {
+                agent?: string;
+                durationMs?: number;
+                phase?: string;
+                timeoutMs?: number;
+              };
+              event: string;
+            }
+        );
+      assert.ok(
+        timeoutRecords.some(
+          (record) =>
+            record.event === "model_request_error" &&
+            record.details?.agent === "backend-engineer" &&
+            record.details.phase === "awaiting_response_headers" &&
+            record.details.timeoutMs === 10 &&
+            (record.details.durationMs ?? 0) >= 10
+        )
+      );
+      assert.ok(
+        timeoutRecords.some(
+          (record) => record.event === "failure_analysis_started"
+        )
+      );
+      assert.ok(
+        timeoutRecords.some(
+          (record) => record.event === "failure_analysis_completed"
+        )
+      );
+      assert.ok(
+        systemPrompts.some((prompt) =>
+          prompt.includes("You are the failure analyst.")
+        )
+      );
       scope.setEnvironment({ MODEL_TIMEOUT_MS: undefined });
       const continued = await debugChat.continue({
-        message: "REVIEW E2E",
+        message: "Try again",
         sessionId: continuationSession.sessionId,
       });
       assert.equal(continued.text, "Development-team handoff complete.");
+      assert.ok(retryRetainedFailedRequest);
+      scope.setEnvironment({ SESSION_LOG_DIR: undefined });
 
       const eventsBeforeRemoteFailure = debugEvents.length;
       githubFailure = true;
@@ -632,6 +750,28 @@ test("software-development team runs against a safe workspace and mocked GitHub"
       );
       assert.doesNotMatch(remoteFailureTrace, /remote-token-sentinel/);
       assert.doesNotMatch(remoteFailureTrace, /DEBUG_REMOTE_FAILURE/);
+      const sharedLearningPrompts = systemPrompts.filter((prompt) =>
+        prompt.includes("Shared operational lessons from past failures:")
+      );
+      assert.ok(
+        sharedLearningPrompts.some((prompt) =>
+          prompt.includes("You lead a software-development team.")
+        )
+      );
+      assert.ok(
+        sharedLearningPrompts.some((prompt) =>
+          prompt.includes("You are the code reviewer.")
+        )
+      );
+      assert.ok(
+        sharedLearningPrompts.every(
+          (prompt) =>
+            !(
+              prompt.includes("direct-model-sentinel") ||
+              prompt.includes("remote-token-sentinel")
+            )
+        )
+      );
 
       const eventsBeforeUnknownTool = debugEvents.length;
       const debugResult = await debugChat.start({
@@ -701,6 +841,25 @@ test("software-development team runs against a safe workspace and mocked GitHub"
             "get_workspace_git_status",
             "github_create_pull_request",
             "github_get_pull_request",
+          ].includes(tool.name)
+        )
+      );
+
+      const analystTools = createSoftwareDevelopmentTools({
+        agent: "failure-analyst",
+        delegate: async () => ({}),
+        loadSkill: async () => "",
+        principalId: "analyst-user",
+        requestApproval: () => ({ approvalId: "approval-id", message: "" }),
+        specialists: ["backend-engineer"],
+      });
+      assert.ok(
+        !analystTools.some((tool) =>
+          [
+            "create_workspace_file",
+            "github_create_pull_request",
+            "run_workspace_check",
+            "write_workspace_file",
           ].includes(tool.name)
         )
       );

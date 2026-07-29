@@ -97,6 +97,14 @@ The file records user messages, lead and specialist activity, model requests and
 
 Logging is best effort. A write failure does not stop a request, but `DEBUG=1` or `DEBUG=2` reports it with a `[log]` line.
 
+For the software-development team, recoverable model and delegation failures trigger a read-only failure analyst. It receives a bounded safe summary of the failure and request telemetry, recommends one adjustment, and the lead retries up to 2 times. Session logs record `failure_analysis_started`, `failure_analysis_completed`, or `failure_analysis_failed` events. The analyst cannot edit files, delegate work, request approval, or persist team-learning records.
+
+## Shared team learning
+
+The runtime stores safe, deterministic lessons from each team error in `.data/team-learning/<team>.json`. Lessons are shared by all users of that team and are included in later lead and specialist prompts. For example, a relative-path error teaches future software-development sessions to use `snake.html` rather than `/workspace/snake.html`.
+
+Learning records only a fixed lesson category, count, and timestamp. It never stores raw error text, user messages, model output, or credentials. Learning cannot edit source files, prompts, tool schemas, permissions, or approval rules.
+
 ## HTTP API
 
 ```bash
